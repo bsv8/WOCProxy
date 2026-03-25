@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,12 +29,15 @@ type Config struct {
 	UpstreamRootURL string
 	MinInterval     time.Duration
 	Transport       http.RoundTripper
+	// Logger 用于记录代理请求摘要与上游失败日志；为空时不输出日志。
+	Logger *slog.Logger
 }
 
 type Proxy struct {
 	upstreamRoot *url.URL
 	client       *http.Client
 	minInterval  time.Duration
+	logger       *slog.Logger
 }
 
 func New(cfg Config) (*Proxy, error) {
@@ -59,6 +63,7 @@ func New(cfg Config) (*Proxy, error) {
 		upstreamRoot: upstreamRoot,
 		client:       &http.Client{Transport: transport},
 		minInterval:  cfg.MinInterval,
+		logger:       cfg.Logger,
 	}, nil
 }
 
@@ -68,7 +73,7 @@ func (p *Proxy) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p.handleProxy(w, r)
 	})
-	return mux
+	return p.withAccessLog(mux)
 }
 
 func (p *Proxy) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -107,6 +112,12 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		p.logWarn("upstream request failed",
+			slog.String("method", strings.TrimSpace(r.Method)),
+			slog.String("path", r.URL.RequestURI()),
+			slog.String("target_url", target.String()),
+			slog.String("error", err.Error()),
+		)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -122,6 +133,26 @@ func (p *Proxy) UpstreamRootURL() string {
 		return ""
 	}
 	return strings.TrimRight(p.upstreamRoot.String(), "/")
+}
+
+func (p *Proxy) withAccessLog(next http.Handler) http.Handler {
+	if next == nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "handler is not initialized", http.StatusInternalServerError)
+		})
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedAt := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		p.logInfo("request served",
+			slog.String("method", strings.TrimSpace(r.Method)),
+			slog.String("path", r.URL.RequestURI()),
+			slog.Int("status", rec.statusCode),
+			slog.Int64("duration_ms", time.Since(startedAt).Milliseconds()),
+			slog.String("remote_addr", strings.TrimSpace(r.RemoteAddr)),
+		)
+	})
 }
 
 func NormalizeRootURL(rootURL string) string {
@@ -146,10 +177,34 @@ func DefaultBaseURLForNetwork(network string) string {
 	return BaseURLForNetwork(DefaultRootURL, network)
 }
 
+func (p *Proxy) logInfo(msg string, attrs ...slog.Attr) {
+	if p == nil || p.logger == nil {
+		return
+	}
+	p.logger.LogAttrs(context.Background(), slog.LevelInfo, msg, attrs...)
+}
+
+func (p *Proxy) logWarn(msg string, attrs ...slog.Attr) {
+	if p == nil || p.logger == nil {
+		return
+	}
+	p.logger.LogAttrs(context.Background(), slog.LevelWarn, msg, attrs...)
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
+	r.ResponseWriter.WriteHeader(statusCode)
 }
 
 func cloneHeadersWithoutHopByHop(src http.Header) http.Header {

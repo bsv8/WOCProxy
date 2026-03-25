@@ -1,8 +1,10 @@
 package wocproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -123,5 +125,37 @@ func TestProxySetsStableUserAgentForUpstream(t *testing.T) {
 	}
 	if gotUA == "" {
 		t.Fatalf("upstream user-agent is empty")
+	}
+}
+
+func TestProxyLogsAccessSummaryAndUpstreamFailure(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	proxy, err := New(Config{
+		UpstreamRootURL: "http://127.0.0.1:1",
+		Logger:          logger,
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	srv := httptest.NewServer(proxy.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v1/bsv/test/chain/info")
+	if err != nil {
+		t.Fatalf("GET proxied chain info error: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	out := logBuf.String()
+	if !strings.Contains(out, "request served") {
+		t.Fatalf("expected access log, got: %s", out)
+	}
+	if !strings.Contains(out, "upstream request failed") {
+		t.Fatalf("expected upstream failure log, got: %s", out)
+	}
+	if !strings.Contains(out, "path=/v1/bsv/test/chain/info") {
+		t.Fatalf("expected path field in logs, got: %s", out)
 	}
 }
