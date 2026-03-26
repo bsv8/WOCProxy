@@ -1,13 +1,17 @@
 package wocproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +23,9 @@ const (
 	DefaultUpstreamRootURL = "https://api.whatsonchain.com"
 	ServiceName            = "woc-proxy"
 	ServiceVersion         = "1.0.0"
+	DefaultMaxRetries      = 3
+	DefaultRetryBaseDelay  = 1500 * time.Millisecond
+	DefaultRetryMaxDelay   = 12 * time.Second
 )
 
 // Config 描述透明代理运行参数。
@@ -29,6 +36,9 @@ type Config struct {
 	UpstreamRootURL string
 	MinInterval     time.Duration
 	Transport       http.RoundTripper
+	MaxRetries      int
+	RetryBaseDelay  time.Duration
+	RetryMaxDelay   time.Duration
 	// Logger 用于记录代理请求摘要与上游失败日志；为空时不输出日志。
 	Logger *slog.Logger
 }
@@ -37,6 +47,10 @@ type Proxy struct {
 	upstreamRoot *url.URL
 	client       *http.Client
 	minInterval  time.Duration
+	maxRetries   int
+	retryBase    time.Duration
+	retryMax     time.Duration
+	rateGate     *intervalTransport
 	logger       *slog.Logger
 }
 
@@ -57,12 +71,31 @@ func New(cfg Config) (*Proxy, error) {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	transport = newIntervalTransport(transport, cfg.MinInterval)
+	rateGate := newIntervalTransport(transport, cfg.MinInterval)
+	maxRetries := cfg.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	retryBase := cfg.RetryBaseDelay
+	if retryBase <= 0 {
+		retryBase = DefaultRetryBaseDelay
+	}
+	retryMax := cfg.RetryMaxDelay
+	if retryMax <= 0 {
+		retryMax = DefaultRetryMaxDelay
+	}
+	if retryMax < retryBase {
+		retryMax = retryBase
+	}
 
 	return &Proxy{
 		upstreamRoot: upstreamRoot,
-		client:       &http.Client{Transport: transport},
+		client:       &http.Client{Transport: rateGate},
 		minInterval:  cfg.MinInterval,
+		maxRetries:   maxRetries,
+		retryBase:    retryBase,
+		retryMax:     retryMax,
+		rateGate:     rateGate,
 		logger:       cfg.Logger,
 	}, nil
 }
@@ -97,28 +130,74 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	target.Path = r.URL.Path
 	target.RawQuery = r.URL.RawQuery
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
+	bodyBytes, err := readRequestBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	req.Header = cloneHeadersWithoutHopByHop(r.Header)
-	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
-		req.Header.Set("User-Agent", "bsv8-wocproxy/1.0")
-	}
-	if r.ContentLength >= 0 {
-		req.ContentLength = r.ContentLength
-	}
+	defer func() {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}()
 
-	resp, err := p.client.Do(req)
-	if err != nil {
+	var resp *http.Response
+	var attemptErr error
+	attempts := maxInt(p.maxRetries+1, 1)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		req, buildErr := p.buildUpstreamRequest(r.Context(), r, target.String(), bodyBytes)
+		if buildErr != nil {
+			http.Error(w, buildErr.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, attemptErr = p.client.Do(req)
+		if attemptErr == nil {
+			if !shouldRetryStatus(resp.StatusCode) || attempt == attempts {
+				break
+			}
+			retryDelay := p.retryDelayForResponse(attempt, resp)
+			p.logWarn("upstream temporary response, retry scheduled",
+				slog.String("method", strings.TrimSpace(r.Method)),
+				slog.String("path", r.URL.RequestURI()),
+				slog.String("target_url", target.String()),
+				slog.Int("status", resp.StatusCode),
+				slog.Int("attempt", attempt),
+				slog.Int64("retry_after_ms", retryDelay.Milliseconds()),
+			)
+			if !sleepWithRatePenalty(r.Context(), p.rateGate, retryDelay) {
+				_ = resp.Body.Close()
+				http.Error(w, r.Context().Err().Error(), http.StatusGatewayTimeout)
+				return
+			}
+			_ = resp.Body.Close()
+			resp = nil
+			continue
+		}
+		if !shouldRetryError(attemptErr) || attempt == attempts {
+			break
+		}
+		retryDelay := p.retryDelayForError(attempt)
+		p.logWarn("upstream temporary error, retry scheduled",
+			slog.String("method", strings.TrimSpace(r.Method)),
+			slog.String("path", r.URL.RequestURI()),
+			slog.String("target_url", target.String()),
+			slog.String("error", attemptErr.Error()),
+			slog.Int("attempt", attempt),
+			slog.Int64("retry_after_ms", retryDelay.Milliseconds()),
+		)
+		if !sleepWithRatePenalty(r.Context(), p.rateGate, retryDelay) {
+			http.Error(w, r.Context().Err().Error(), http.StatusGatewayTimeout)
+			return
+		}
+	}
+	if attemptErr != nil {
 		p.logWarn("upstream request failed",
 			slog.String("method", strings.TrimSpace(r.Method)),
 			slog.String("path", r.URL.RequestURI()),
 			slog.String("target_url", target.String()),
-			slog.String("error", err.Error()),
+			slog.String("error", attemptErr.Error()),
 		)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, attemptErr.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -126,6 +205,34 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	copyHeadersWithoutHopByHop(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (p *Proxy) buildUpstreamRequest(ctx context.Context, src *http.Request, rawURL string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, src.Method, rawURL, bytesReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = cloneHeadersWithoutHopByHop(src.Header)
+	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
+		req.Header.Set("User-Agent", "bsv8-wocproxy/1.0")
+	}
+	if len(body) > 0 {
+		req.ContentLength = int64(len(body))
+	} else if src.ContentLength >= 0 {
+		req.ContentLength = src.ContentLength
+	}
+	return req, nil
+}
+
+func (p *Proxy) retryDelayForResponse(attempt int, resp *http.Response) time.Duration {
+	if d, ok := retryAfterDelay(resp); ok {
+		return clampRetryDelay(d, p.retryBase, p.retryMax)
+	}
+	return p.retryDelayForError(attempt)
+}
+
+func (p *Proxy) retryDelayForError(attempt int) time.Duration {
+	return exponentialRetryDelay(attempt, p.retryBase, p.retryMax)
 }
 
 func (p *Proxy) UpstreamRootURL() string {
@@ -241,12 +348,9 @@ type intervalTransport struct {
 	nextAllowed time.Time
 }
 
-func newIntervalTransport(base http.RoundTripper, interval time.Duration) http.RoundTripper {
+func newIntervalTransport(base http.RoundTripper, interval time.Duration) *intervalTransport {
 	if base == nil {
 		base = http.DefaultTransport
-	}
-	if interval <= 0 {
-		return base
 	}
 	return &intervalTransport{base: base, interval: interval}
 }
@@ -286,6 +390,134 @@ func (t *intervalTransport) reserveSlot() time.Time {
 	if !t.nextAllowed.IsZero() && t.nextAllowed.After(now) {
 		slot = t.nextAllowed
 	}
-	t.nextAllowed = slot.Add(t.interval)
+	if t.interval > 0 {
+		t.nextAllowed = slot.Add(t.interval)
+	} else {
+		t.nextAllowed = slot
+	}
 	return slot
+}
+
+func (t *intervalTransport) Penalize(wait time.Duration) {
+	if t == nil || wait <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	until := time.Now().Add(wait)
+	if until.After(t.nextAllowed) {
+		t.nextAllowed = until
+	}
+}
+
+func readRequestBody(r *http.Request) ([]byte, error) {
+	if r == nil || r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func bytesReader(body []byte) io.Reader {
+	if len(body) == 0 {
+		return nil
+	}
+	return bytes.NewReader(body)
+}
+
+func shouldRetryStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
+}
+
+func retryAfterDelay(resp *http.Response) (time.Duration, bool) {
+	if resp == nil {
+		return 0, false
+	}
+	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if raw == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if ts, err := http.ParseTime(raw); err == nil {
+		d := time.Until(ts)
+		if d > 0 {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func exponentialRetryDelay(attempt int, base time.Duration, maxDelay time.Duration) time.Duration {
+	if base <= 0 {
+		base = DefaultRetryBaseDelay
+	}
+	if maxDelay <= 0 {
+		maxDelay = DefaultRetryMaxDelay
+	}
+	if maxDelay < base {
+		maxDelay = base
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	exp := math.Pow(2, float64(attempt-1))
+	delay := time.Duration(float64(base) * exp)
+	return clampRetryDelay(delay, base, maxDelay)
+}
+
+func clampRetryDelay(delay, base, maxDelay time.Duration) time.Duration {
+	if delay <= 0 {
+		delay = base
+	}
+	if delay < base {
+		delay = base
+	}
+	if maxDelay > 0 && delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
+}
+
+func sleepWithRatePenalty(ctx context.Context, gate *intervalTransport, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	if gate != nil {
+		gate.Penalize(delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

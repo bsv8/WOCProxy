@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -157,5 +158,68 @@ func TestProxyLogsAccessSummaryAndUpstreamFailure(t *testing.T) {
 	}
 	if !strings.Contains(out, "path=/v1/bsv/test/chain/info") {
 		t.Fatalf("expected path field in logs, got: %s", out)
+	}
+}
+
+func TestProxyRetriesTemporaryUpstreamResponse(t *testing.T) {
+	var mu sync.Mutex
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request body error: %v", err)
+		}
+		mu.Lock()
+		callCount++
+		current := callCount
+		mu.Unlock()
+		if current == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("retry please"))
+			return
+		}
+		if string(body) != `{"hello":"world"}` {
+			t.Fatalf("unexpected upstream body: %q", string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Config{
+		UpstreamRootURL: upstream.URL,
+		MinInterval:     1 * time.Millisecond,
+		MaxRetries:      2,
+		RetryBaseDelay:  10 * time.Millisecond,
+		RetryMaxDelay:   10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	srv := httptest.NewServer(proxy.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/v1/bsv/test/address/history", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("new request error: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy request error: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected response status: got=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if strings.TrimSpace(string(raw)) != `{"ok":true}` {
+		t.Fatalf("unexpected response body: %s", string(raw))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if callCount != 2 {
+		t.Fatalf("unexpected upstream call count: got=%d want=2", callCount)
 	}
 }

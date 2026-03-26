@@ -47,6 +47,14 @@ type UTXO struct {
 	Value uint64
 }
 
+type utxoItem struct {
+	TxID               string `json:"tx_hash"`
+	Vout               uint32 `json:"tx_pos"`
+	Value              uint64 `json:"value"`
+	IsSpentInMempoolTx bool   `json:"isSpentInMempoolTx"`
+	Status             string `json:"status"`
+}
+
 type AddressHistoryItem struct {
 	TxID   string
 	Height int64
@@ -149,38 +157,37 @@ func (c *Client) GetAddressConfirmedUnspent(ctx context.Context, address string)
 			return nil, err
 		}
 	}
-	var raw []struct {
-		TxID               string `json:"tx_hash"`
-		Vout               uint32 `json:"tx_pos"`
-		Value              uint64 `json:"value"`
-		IsSpentInMempoolTx bool   `json:"isSpentInMempoolTx"`
+	raw, err := decodeUTXOItems(body)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		var wrapped struct {
-			Result []struct {
-				TxID               string `json:"tx_hash"`
-				Vout               uint32 `json:"tx_pos"`
-				Value              uint64 `json:"value"`
-				IsSpentInMempoolTx bool   `json:"isSpentInMempoolTx"`
-			} `json:"result"`
-		}
-		if wrapErr := json.Unmarshal(body, &wrapped); wrapErr != nil {
-			return nil, fmt.Errorf("decode utxos: %w", err)
-		}
-		raw = wrapped.Result
+	return filterUTXOs(raw, false), nil
+}
+
+// GetAddressSpendableUnspent 返回链上当前可花的未花费输出。
+// 设计说明：
+// - confirmed / unconfirmed 在“是否可继续构造支付”上不是硬边界；
+// - 只要索引器可见、且没有被 mempool 中其他交易占用，就应视为 spendable；
+// - e2e 资金预检与费用池开池都应使用这条更贴近真实花费语义的查询。
+func (c *Client) GetAddressSpendableUnspent(ctx context.Context, address string) ([]UTXO, error) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return nil, fmt.Errorf("address is required")
 	}
-	out := make([]UTXO, 0, len(raw))
-	for _, item := range raw {
-		if item.IsSpentInMempoolTx {
-			continue
+	body, err := c.get(ctx, "/address/"+address+"/unspent/all")
+	if err != nil {
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+			return nil, err
 		}
-		out = append(out, UTXO{
-			TxID:  strings.TrimSpace(item.TxID),
-			Vout:  item.Vout,
-			Value: item.Value,
-		})
+		// 旧代理或旧 WOC 接口不支持 /unspent/all 时，退回 confirmed 视图。
+		return c.GetAddressConfirmedUnspent(ctx, address)
 	}
-	return out, nil
+	raw, err := decodeUTXOItems(body)
+	if err != nil {
+		return nil, err
+	}
+	return filterUTXOs(raw, true), nil
 }
 
 func (c *Client) GetChainInfo(ctx context.Context) (uint32, error) {
@@ -238,6 +245,39 @@ func (c *Client) GetAddressUnconfirmedHistory(ctx context.Context, address strin
 		return nil, err
 	}
 	return decodeUnconfirmedHistory(body)
+}
+
+func decodeUTXOItems(body []byte) ([]utxoItem, error) {
+	var raw []utxoItem
+	if err := json.Unmarshal(body, &raw); err == nil {
+		return raw, nil
+	}
+	var wrapped struct {
+		Result []utxoItem `json:"result"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("decode utxos: %w", err)
+	}
+	return wrapped.Result, nil
+}
+
+func filterUTXOs(raw []utxoItem, includeUnconfirmed bool) []UTXO {
+	out := make([]UTXO, 0, len(raw))
+	for _, item := range raw {
+		if item.IsSpentInMempoolTx {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(item.Status))
+		if !includeUnconfirmed && status == "unconfirmed" {
+			continue
+		}
+		out = append(out, UTXO{
+			TxID:  strings.TrimSpace(item.TxID),
+			Vout:  item.Vout,
+			Value: item.Value,
+		})
+	}
+	return out
 }
 
 func (c *Client) PostTxRaw(ctx context.Context, txHex string) (string, error) {
