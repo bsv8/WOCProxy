@@ -351,6 +351,31 @@ func (c *Client) GetTxHash(ctx context.Context, txid string) (TxDetail, error) {
 	return out, nil
 }
 
+// GetTxHex 返回交易原始 hex。
+// 设计说明：
+// - /tx/hash/{txid} 这类详情接口里的 scriptPubKey.hex 适合展示和浏览；
+// - 但对 inscription / token 组合脚本，第三方接口可能会做“规范化展示”，并不保证和原始锁定脚本逐字节等价；
+// - 参与签名时必须使用 raw tx 里的真实输出脚本，不能直接信任浏览接口拆出来的 scriptPubKey.hex。
+func (c *Client) GetTxHex(ctx context.Context, txid string) (string, error) {
+	txid = strings.TrimSpace(txid)
+	if txid == "" {
+		return "", fmt.Errorf("txid is required")
+	}
+	body, err := c.get(ctx, "/tx/"+txid+"/hex")
+	if err != nil {
+		return "", err
+	}
+	raw := strings.TrimSpace(string(body))
+	if raw == "" {
+		return "", fmt.Errorf("tx hex is empty")
+	}
+	var quoted string
+	if err := json.Unmarshal(body, &quoted); err == nil && strings.TrimSpace(quoted) != "" {
+		return strings.TrimSpace(quoted), nil
+	}
+	return raw, nil
+}
+
 func (a AuthConfig) Apply(req *http.Request) error {
 	if req == nil {
 		return fmt.Errorf("request is nil")

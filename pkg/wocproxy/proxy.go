@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,7 @@ type Proxy struct {
 	retryMax     time.Duration
 	rateGate     *intervalTransport
 	logger       *slog.Logger
+	reqSeq       atomic.Uint64
 }
 
 func New(cfg Config) (*Proxy, error) {
@@ -129,6 +131,15 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	target := *p.upstreamRoot
 	target.Path = r.URL.Path
 	target.RawQuery = r.URL.RawQuery
+	requestID := p.nextRequestID()
+	requestEnteredAt := time.Now()
+	p.logInfo("proxy request accepted",
+		slog.String("request_id", requestID),
+		slog.String("method", strings.TrimSpace(r.Method)),
+		slog.String("path", r.URL.RequestURI()),
+		slog.String("target_url", target.String()),
+		slog.String("remote_addr", strings.TrimSpace(r.RemoteAddr)),
+	)
 
 	bodyBytes, err := readRequestBody(r)
 	if err != nil {
@@ -145,7 +156,7 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var attemptErr error
 	attempts := maxInt(p.maxRetries+1, 1)
 	for attempt := 1; attempt <= attempts; attempt++ {
-		req, buildErr := p.buildUpstreamRequest(r.Context(), r, target.String(), bodyBytes)
+		req, buildErr := p.buildUpstreamRequest(r.Context(), r, target.String(), bodyBytes, requestID, requestEnteredAt, attempt)
 		if buildErr != nil {
 			http.Error(w, buildErr.Error(), http.StatusBadGateway)
 			return
@@ -157,6 +168,7 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			retryDelay := p.retryDelayForResponse(attempt, resp)
 			p.logWarn("upstream temporary response, retry scheduled",
+				slog.String("request_id", requestID),
 				slog.String("method", strings.TrimSpace(r.Method)),
 				slog.String("path", r.URL.RequestURI()),
 				slog.String("target_url", target.String()),
@@ -178,6 +190,7 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		retryDelay := p.retryDelayForError(attempt)
 		p.logWarn("upstream temporary error, retry scheduled",
+			slog.String("request_id", requestID),
 			slog.String("method", strings.TrimSpace(r.Method)),
 			slog.String("path", r.URL.RequestURI()),
 			slog.String("target_url", target.String()),
@@ -192,6 +205,7 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if attemptErr != nil {
 		p.logWarn("upstream request failed",
+			slog.String("request_id", requestID),
 			slog.String("method", strings.TrimSpace(r.Method)),
 			slog.String("path", r.URL.RequestURI()),
 			slog.String("target_url", target.String()),
@@ -207,8 +221,17 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *Proxy) buildUpstreamRequest(ctx context.Context, src *http.Request, rawURL string, body []byte) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, src.Method, rawURL, bytesReader(body))
+func (p *Proxy) buildUpstreamRequest(ctx context.Context, src *http.Request, rawURL string, body []byte, requestID string, requestEnteredAt time.Time, attempt int) (*http.Request, error) {
+	traceCtx := context.WithValue(ctx, roundTripTraceContextKey{}, roundTripTrace{
+		RequestID:        strings.TrimSpace(requestID),
+		RequestMethod:    strings.TrimSpace(src.Method),
+		RequestPath:      src.URL.RequestURI(),
+		TargetURL:        strings.TrimSpace(rawURL),
+		RequestEnteredAt: requestEnteredAt,
+		Attempt:          attempt,
+		Logger:           p.logger,
+	})
+	req, err := http.NewRequestWithContext(traceCtx, src.Method, rawURL, bytesReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +321,14 @@ func (p *Proxy) logWarn(msg string, attrs ...slog.Attr) {
 	p.logger.LogAttrs(context.Background(), slog.LevelWarn, msg, attrs...)
 }
 
+func (p *Proxy) nextRequestID() string {
+	if p == nil {
+		return ""
+	}
+	seq := p.reqSeq.Add(1)
+	return fmt.Sprintf("wocp-%d", seq)
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -359,10 +390,55 @@ func (t *intervalTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if req == nil {
 		return nil, fmt.Errorf("request is nil")
 	}
+	trace := traceFromContext(req.Context())
+	queueStartedAt := time.Now()
 	if err := t.wait(req.Context()); err != nil {
+		if trace.Enabled() {
+			trace.Logger.LogAttrs(context.Background(), slog.LevelWarn, "upstream dispatch canceled before send",
+				slog.String("request_id", trace.RequestID),
+				slog.String("method", trace.RequestMethod),
+				slog.String("path", trace.RequestPath),
+				slog.String("target_url", trace.TargetURL),
+				slog.Int("attempt", trace.Attempt),
+				slog.Int64("queue_wait_ms", time.Since(queueStartedAt).Milliseconds()),
+				slog.String("error", err.Error()),
+			)
+		}
 		return nil, err
 	}
-	return t.base.RoundTrip(req)
+	dispatchAt := time.Now()
+	if trace.Enabled() {
+		trace.Logger.LogAttrs(context.Background(), slog.LevelInfo, "upstream dispatch started",
+			slog.String("request_id", trace.RequestID),
+			slog.String("method", trace.RequestMethod),
+			slog.String("path", trace.RequestPath),
+			slog.String("target_url", trace.TargetURL),
+			slog.Int("attempt", trace.Attempt),
+			slog.String("request_entered_at", trace.RequestEnteredAt.UTC().Format(time.RFC3339Nano)),
+			slog.String("dispatch_at", dispatchAt.UTC().Format(time.RFC3339Nano)),
+			slog.Int64("queue_wait_ms", dispatchAt.Sub(queueStartedAt).Milliseconds()),
+			slog.Int64("request_age_ms", dispatchAt.Sub(trace.RequestEnteredAt).Milliseconds()),
+		)
+	}
+	resp, err := t.base.RoundTrip(req)
+	if trace.Enabled() {
+		attrs := []slog.Attr{
+			slog.String("request_id", trace.RequestID),
+			slog.String("method", trace.RequestMethod),
+			slog.String("path", trace.RequestPath),
+			slog.String("target_url", trace.TargetURL),
+			slog.Int("attempt", trace.Attempt),
+			slog.Int64("upstream_duration_ms", time.Since(dispatchAt).Milliseconds()),
+		}
+		if err != nil {
+			attrs = append(attrs, slog.String("error", err.Error()))
+			trace.Logger.LogAttrs(context.Background(), slog.LevelWarn, "upstream dispatch failed", attrs...)
+		} else {
+			attrs = append(attrs, slog.Int("status", resp.StatusCode))
+			trace.Logger.LogAttrs(context.Background(), slog.LevelInfo, "upstream dispatch completed", attrs...)
+		}
+	}
+	return resp, err
 }
 
 func (t *intervalTransport) wait(ctx context.Context) error {
@@ -520,4 +596,28 @@ func maxInt(a int, b int) int {
 		return a
 	}
 	return b
+}
+
+type roundTripTraceContextKey struct{}
+
+type roundTripTrace struct {
+	RequestID        string
+	RequestMethod    string
+	RequestPath      string
+	TargetURL        string
+	RequestEnteredAt time.Time
+	Attempt          int
+	Logger           *slog.Logger
+}
+
+func (t roundTripTrace) Enabled() bool {
+	return t.Logger != nil
+}
+
+func traceFromContext(ctx context.Context) roundTripTrace {
+	if ctx == nil {
+		return roundTripTrace{}
+	}
+	trace, _ := ctx.Value(roundTripTraceContextKey{}).(roundTripTrace)
+	return trace
 }
