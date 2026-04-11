@@ -31,3 +31,4 @@ go.work.sum
 # .idea/
 # .vscode/
 .vault/
+.vault/wocproxy.log
