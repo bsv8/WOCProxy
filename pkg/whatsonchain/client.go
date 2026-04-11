@@ -47,12 +47,43 @@ type UTXO struct {
 	Value uint64
 }
 
+// BSV21TokenUTXO 表示地址下可见的 BSV21 token carrier 输出。
+// 设计说明：
+// - 这里保留 outpoint + token 数量 + 确认高度，供钱包同步把 1sat carrier 纳入快照；
+// - Value 不由该接口返回，业务侧按 carrier 语义固定为 1 sat 处理。
+type BSV21TokenUTXO struct {
+	TxID        string
+	Vout        uint32
+	TokenID     string
+	AmountText  string
+	BlockHeight int64
+}
+
 type utxoItem struct {
 	TxID               string `json:"tx_hash"`
 	Vout               uint32 `json:"tx_pos"`
 	Value              uint64 `json:"value"`
 	IsSpentInMempoolTx bool   `json:"isSpentInMempoolTx"`
 	Status             string `json:"status"`
+}
+
+type bsv21TokenUnspentItem struct {
+	Vout uint32 `json:"vout"`
+	Data struct {
+		BSV20 struct {
+			ID  string `json:"id"`
+			Amt any    `json:"amt"`
+		} `json:"bsv20"`
+	} `json:"data"`
+	Current struct {
+		TxID        string `json:"txid"`
+		BlockHeight int64  `json:"blockHeight"`
+	} `json:"current"`
+}
+
+type bsv21TokenUnspentResp struct {
+	Tokens     []bsv21TokenUnspentItem `json:"tokens"`
+	TotalCount int                     `json:"total_count"`
 }
 
 type AddressHistoryItem struct {
@@ -188,6 +219,70 @@ func (c *Client) GetAddressSpendableUnspent(ctx context.Context, address string)
 		return nil, err
 	}
 	return filterUTXOs(raw, true), nil
+}
+
+func (c *Client) GetAddressBSV21TokenUnspent(ctx context.Context, address string) ([]BSV21TokenUTXO, error) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return nil, fmt.Errorf("address is required")
+	}
+	const pageSize = 200
+	offset := 0
+	out := make([]BSV21TokenUTXO, 0, 16)
+	for {
+		path := fmt.Sprintf("/token/bsv21/%s/unspent?limit=%d&offset=%d&filterMempool=both", address, pageSize, offset)
+		body, err := c.get(ctx, path)
+		if err != nil {
+			var httpErr *HTTPError
+			if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+				return []BSV21TokenUTXO{}, nil
+			}
+			return nil, err
+		}
+		var resp bsv21TokenUnspentResp
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("decode bsv21 unspent: %w", err)
+		}
+		if len(resp.Tokens) == 0 {
+			break
+		}
+		for _, item := range resp.Tokens {
+			txid := strings.ToLower(strings.TrimSpace(item.Current.TxID))
+			if txid == "" {
+				continue
+			}
+			out = append(out, BSV21TokenUTXO{
+				TxID:        txid,
+				Vout:        item.Vout,
+				TokenID:     strings.ToLower(strings.TrimSpace(item.Data.BSV20.ID)),
+				AmountText:  normalizeWOCQuantityText(item.Data.BSV20.Amt),
+				BlockHeight: item.Current.BlockHeight,
+			})
+		}
+		if len(resp.Tokens) < pageSize {
+			break
+		}
+		if resp.TotalCount > 0 && offset+len(resp.Tokens) >= resp.TotalCount {
+			break
+		}
+		offset += len(resp.Tokens)
+	}
+	return out, nil
+}
+
+func normalizeWOCQuantityText(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(t)
+	case json.Number:
+		return strings.TrimSpace(t.String())
+	case float64:
+		return strings.TrimSpace(strconv.FormatUint(uint64(t), 10))
+	default:
+		return strings.TrimSpace(fmt.Sprint(t))
+	}
 }
 
 func (c *Client) GetChainInfo(ctx context.Context) (uint32, error) {
