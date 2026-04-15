@@ -221,6 +221,61 @@ func (c *Client) GetAddressSpendableUnspent(ctx context.Context, address string)
 	return filterUTXOs(raw, true), nil
 }
 
+// GetScriptConfirmedUnspent 返回脚本哈希对应的已确认未花费输出。
+// 设计说明：
+// - 用于钱包补充识别 p2pk 这类“地址端点不可见”的输出；
+// - scriptHash 来自锁定脚本原始 bytes 的 sha256（十六进制）。
+func (c *Client) GetScriptConfirmedUnspent(ctx context.Context, scriptHash string) ([]UTXO, error) {
+	scriptHash = strings.ToLower(strings.TrimSpace(scriptHash))
+	if scriptHash == "" {
+		return nil, fmt.Errorf("script hash is required")
+	}
+	body, err := c.get(ctx, "/script/"+url.PathEscape(scriptHash)+"/confirmed/unspent")
+	if err != nil {
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+			return nil, err
+		}
+		body, err = c.get(ctx, "/script/"+url.PathEscape(scriptHash)+"/unspent")
+		if err != nil {
+			// 对不存在的脚本哈希（例如大小端探测）返回空集合，不当成失败。
+			if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+				return []UTXO{}, nil
+			}
+			return nil, err
+		}
+	}
+	raw, err := decodeUTXOItems(body)
+	if err != nil {
+		return nil, err
+	}
+	return filterUTXOs(raw, false), nil
+}
+
+// GetScriptSpendableUnspent 返回脚本哈希当前可花费的未花费输出（含未确认）。
+// 设计说明：
+// - 与地址 spendable 语义保持一致：只要未被 mempool 占用就可作为候选；
+// - 旧端点不支持 /unspent/all 时回退 confirmed 视图。
+func (c *Client) GetScriptSpendableUnspent(ctx context.Context, scriptHash string) ([]UTXO, error) {
+	scriptHash = strings.ToLower(strings.TrimSpace(scriptHash))
+	if scriptHash == "" {
+		return nil, fmt.Errorf("script hash is required")
+	}
+	body, err := c.get(ctx, "/script/"+url.PathEscape(scriptHash)+"/unspent/all")
+	if err != nil {
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+			return nil, err
+		}
+		return c.GetScriptConfirmedUnspent(ctx, scriptHash)
+	}
+	raw, err := decodeUTXOItems(body)
+	if err != nil {
+		return nil, err
+	}
+	return filterUTXOs(raw, true), nil
+}
+
 func (c *Client) GetAddressBSV21TokenUnspent(ctx context.Context, address string) ([]BSV21TokenUTXO, error) {
 	address = strings.TrimSpace(address)
 	if address == "" {
