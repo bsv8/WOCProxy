@@ -23,6 +23,34 @@ func TestBaseURLForNetwork(t *testing.T) {
 	}
 }
 
+func TestProxyPreservesUpstreamBasePath(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy, err := New(Config{
+		UpstreamRootURL: upstream.URL + "/v1/bsv/test",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	srv := httptest.NewServer(proxy.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/address/testaddr/confirmed/unspent")
+	if err != nil {
+		t.Fatalf("GET proxied address unspent error: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if gotPath != "/v1/bsv/test/address/testaddr/confirmed/unspent" {
+		t.Fatalf("unexpected upstream path: %q", gotPath)
+	}
+}
+
 func TestHandlerHealthz(t *testing.T) {
 	proxy, err := New(Config{})
 	if err != nil {

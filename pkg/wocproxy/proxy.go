@@ -129,7 +129,7 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// 这里不用 ReverseProxy，避免它把 User-Agent 清空后触发上游 Cloudflare 403。
 	target := *p.upstreamRoot
-	target.Path = r.URL.Path
+	target.Path = joinURLPath(target.Path, r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
 	requestID := p.nextRequestID()
 	requestEnteredAt := time.Now()
@@ -245,6 +245,21 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, src *http.Request, raw
 		req.ContentLength = src.ContentLength
 	}
 	return req, nil
+}
+
+func joinURLPath(basePath string, reqPath string) string {
+	basePath = strings.TrimRight(strings.TrimSpace(basePath), "/")
+	reqPath = strings.TrimSpace(reqPath)
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	if !strings.HasPrefix(reqPath, "/") {
+		reqPath = "/" + reqPath
+	}
+	if basePath == "" || basePath == "/" {
+		return reqPath
+	}
+	return basePath + reqPath
 }
 
 func (p *Proxy) retryDelayForResponse(attempt int, resp *http.Response) time.Duration {
